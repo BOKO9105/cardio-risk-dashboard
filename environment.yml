@@ -1,0 +1,19 @@
+name: ml_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy=1.25
+  - pandas=2.0
+  - scikit-learn=1.7
+  - statsmodels=0.14
+  - matplotlib
+  - seaborn
+  - jupyter
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+    - lightgbm==4.3.0
+    - shap==0.44.1
