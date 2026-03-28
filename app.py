@@ -161,6 +161,52 @@ with tab0:
         st.markdown("### Processus de Validation :")
         st.write("✅ Nettoyage de Données (Imputation)\n✅ Découverte Visuelle (t-SNE, ACP)\n✅ Création de Phénotypes Idiopathiques\n✅ Validation Croisée K-Fold\n✅ Outil de Prévention Primaire")
 
+    # --- Aperçu du Dataset en bas de page ---
+    st.markdown("---")
+    st.markdown("<h2 class='title-h2'>📋 Aperçu du Jeu de Données (Framingham Cohort)</h2>", unsafe_allow_html=True)
+
+    if df_raw is not None:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.markdown(f"<div class='metric-card'><div class='metric-label'>Patients Total</div><div class='metric-value'>{len(df_raw)}</div></div>", unsafe_allow_html=True)
+        m2.markdown(f"<div class='metric-card'><div class='metric-label'>Variables Cliniques</div><div class='metric-value'>{len(df_raw.columns) - 2}</div></div>", unsafe_allow_html=True)
+        m3.markdown(f"<div class='metric-card'><div class='metric-label'>Cas CHD à 10 ans</div><div class='metric-value'>{df_raw['TenYearCHD'].sum()}</div></div>", unsafe_allow_html=True)
+        m4.markdown(f"<div class='metric-card'><div class='metric-label'>Prévalence (%)</div><div class='metric-value'>{df_raw['TenYearCHD'].mean()*100:.1f}%</div></div>", unsafe_allow_html=True)
+
+        col_prev, col_stat = st.columns([1.2, 1])
+
+        with col_prev:
+            st.markdown("<h3 class='title-h2'>Échantillon des 10 premiers patients</h3>", unsafe_allow_html=True)
+            st.dataframe(
+                df_raw.head(10).style.highlight_max(axis=0, color='#1E4D2B').highlight_min(axis=0, color='#4D1E1E'),
+                use_container_width=True
+            )
+
+        with col_stat:
+            st.markdown("<h3 class='title-h2'>Statistiques Descriptives</h3>", unsafe_allow_html=True)
+            desc = df_raw.describe().round(2)
+            st.dataframe(desc, use_container_width=True)
+
+        with st.expander("💡 Description des Variables Cliniques", expanded=False):
+            st.markdown("""
+| Variable | Description Médicale |
+|---|---|
+| `age` | Âge du patient (années) |
+| `sex` | Genre (M / F) |
+| `is_smoking` | Fumeur actif déclaré (YES / NO) |
+| `cigsPerDay` | Nombre de cigarettes par jour |
+| `BPMeds` | Traitement anti-hypertenseur actif |
+| `prevalentStroke` | Antécédent d'AVC |
+| `prevalentHyp` | Hypertension diagnostiquée |
+| `diabetes` | Diabète diagnostiqué |
+| `totChol` | Cholestérol total (mg/dL) |
+| `sysBP` | Tension Systolique (mmHg) |
+| `diaBP` | Tension Diastolique (mmHg) |
+| `BMI` | Indice de Masse Corporelle |
+| `heartRate` | Fréquence cardiaque au repos (BPM) |
+| `glucose` | Glycémie à jeun (mg/dL) |
+| `TenYearCHD` | **Variable Cible** : CHD dans les 10 ans (0=Non / 1=Oui) |
+""")
+
 # [ONGLET 1]
 with tab1:
     st.markdown("<h1 class='title-h1'>📊 Profilage & Asymétrie Clinique</h1>", unsafe_allow_html=True)
