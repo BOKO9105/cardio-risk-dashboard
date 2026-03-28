@@ -1,18 +1,100 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
 import json
 import os
 import time
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
 
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import f1_score, recall_score, roc_auc_score, confusion_matrix, roc_curve
 from scipy.cluster.hierarchy import dendrogram, linkage
+
+warnings.filterwarnings('ignore')
+
+# ---- Entraînement dynamique (compatible toutes versions Python) ----
+@st.cache_resource
+def train_model_and_results():
+    """Entraîne le modèle au démarrage de l'app et retourne le pipeline et les résultats."""
+    try:
+        df = pd.read_csv("data/train.csv")
+    except:
+        return None, {}
+
+    y = df['TenYearCHD']
+    X = df.drop(columns=['id', 'TenYearCHD'])
+
+    categorical_features = ['sex', 'is_smoking']
+    numeric_features = ['age', 'cigsPerDay', 'totChol', 'sysBP', 'diaBP', 'BMI', 'heartRate', 'glucose']
+    binary_features = ['education', 'BPMeds', 'prevalentStroke', 'prevalentHyp', 'diabetes']
+
+    num_t = Pipeline([('imp', SimpleImputer(strategy='median')), ('scl', StandardScaler())])
+    cat_t = Pipeline([('imp', SimpleImputer(strategy='most_frequent')), ('ohe', OneHotEncoder(drop='first', sparse_output=False))])
+    bin_t = Pipeline([('imp', SimpleImputer(strategy='most_frequent'))])
+
+    preprocessor = ColumnTransformer([
+        ('num', num_t, numeric_features),
+        ('cat', cat_t, categorical_features),
+        ('bin', bin_t, binary_features)
+    ], remainder='passthrough')
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    models_to_fit = {
+        'Régression Logistique': LogisticRegression(max_iter=1500, random_state=42, class_weight='balanced', solver='liblinear'),
+        'Random Forest': RandomForestClassifier(n_estimators=150, max_depth=10, random_state=42, class_weight='balanced'),
+        'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
+    }
+
+    results = {}
+    best_pipeline = None
+    best_f1 = 0
+    best_name = ""
+
+    for name, model in models_to_fit.items():
+        pipe = Pipeline([('preprocessor', preprocessor), ('classifier', model)])
+        cv_scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring='f1')
+        pipe.fit(X_train, y_train)
+        y_pred = pipe.predict(X_test)
+        y_proba = pipe.predict_proba(X_test)[:, 1]
+        f1 = f1_score(y_test, y_pred)
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        cm = confusion_matrix(y_test, y_pred).tolist()
+        results[name] = {
+            'CV F1 Score Mean': float(cv_scores.mean()),
+            'Test F1 Score': float(f1),
+            'Test Recall': float(recall_score(y_test, y_pred)),
+            'Test ROC AUC': float(roc_auc_score(y_test, y_proba)),
+            'Confusion Matrix': cm,
+            'ROC_FPR': fpr[::3].tolist(),
+            'ROC_TPR': tpr[::3].tolist()
+        }
+        if name == 'Régression Logistique':
+            preprocessor_fit = pipe.named_steps['preprocessor'].fit(X_train)
+            cat_enc = preprocessor_fit.named_transformers_['cat'].named_steps['ohe']
+            cat_names = [f"{col}_{v}" for col, vals in zip(categorical_features, cat_enc.categories_) for v in vals[1:]]
+            feat_names = numeric_features + cat_names + binary_features
+            coefs = pipe.named_steps['classifier'].coef_[0]
+            results['Global_Feature_Importance'] = {f: float(abs(c)) for f, c in zip(feat_names, coefs)}
+        if f1 > best_f1:
+            best_f1 = f1
+            best_pipeline = pipe
+            best_name = name
+
+    return best_pipeline, results
 
 # Configuration Master
 st.set_page_config(page_title="Cardio Risk | Master AI", page_icon="📈", layout="wide")
@@ -181,12 +263,11 @@ En santé publique, l'application de ce Clustering permet d'**ajuster les campag
 # [ONGLET 4]
 with tab4:
     st.markdown("<h1 class='title-h1'>🧠 Standards de la Validation Croisée & ROC</h1>", unsafe_allow_html=True)
-    results_path = "models/model_results.json"
     
-    if os.path.exists(results_path):
-        with open(results_path, 'r') as f:
-            results = json.load(f)
-            
+    with st.spinner("Chargement des métriques du modèle..."):
+        _, results = train_model_and_results()
+
+    if results:
         imp_dict = results.pop("Global_Feature_Importance", None)
         
         st.write("Le Machine Learning Médical exige une transparence totale. Voici la justification mathématique et biologique de notre Modèle de Prévention.")
@@ -261,7 +342,7 @@ with tab4:
             """, unsafe_allow_html=True)
 
     else:
-        st.error("Rapport IA introuvable. Effectuez `python train_model.py`.")
+        st.error("⚠️ Données d'entraînement introuvables. Vérifiez que `data/train.csv` est bien présent sur GitHub.")
 
 # [ONGLET 5]
 with tab5:
@@ -269,9 +350,9 @@ with tab5:
     st.image("https://images.unsplash.com/photo-1579684385127-1ef15d508118?w=1200&h=150&fit=crop", use_container_width=True)
     st.write("Insérez les biomarqueurs du dossier patient. La Régression Logistique va statuer sur l'état de la crise CHD et vous livrer les recommandations sanitaires d'usage (Plan de Santé Publique).")
     
-    model_path = "models/best_model.pkl"
-    if os.path.exists(model_path):
-        model = joblib.load(model_path)
+    with st.spinner("Initialisation du modèle diagnostique (entraînement initial)..."):
+        model, _model_results = train_model_and_results()
+    if model is not None:
         with st.form("medical_form"):
             c1, c2, c3 = st.columns(3)
             with c1:
