@@ -314,7 +314,7 @@ with tab4:
         _, results = train_model_and_results()
 
     if results:
-        imp_dict = results.pop("Global_Feature_Importance", None)
+        imp_dict = results.get("Global_Feature_Importance", None)
         
         st.write("Le Machine Learning Médical exige une transparence totale. Voici la justification mathématique et biologique de notre Modèle de Prévention.")
         
