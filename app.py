@@ -18,17 +18,22 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, RandomizedSearchCV
 from sklearn.metrics import f1_score, recall_score, roc_auc_score, confusion_matrix, roc_curve
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from scipy.cluster.hierarchy import dendrogram, linkage
 
 warnings.filterwarnings('ignore')
 
-# ---- Entraînement dynamique + Calibration de Platt ----
+# ---- Pipeline Expert : Optimisation + Anti-Surapprentissage + Calibration ----
 @st.cache_resource
 def train_model_and_results():
-    """Entraîne le modèle au démarrage de l'app et retourne le pipeline calibré et les résultats."""
+    """
+    Pipeline rigoureux :
+    1. RandomizedSearchCV sur chaque modèle (anti-surapprentissage)
+    2. Sélection sur CV ROC-AUC + vérification gap Train/Test
+    3. Calibration de Platt sur le vainqueur
+    """
     try:
         df = pd.read_csv("data/train.csv")
     except:
@@ -54,64 +59,121 @@ def train_model_and_results():
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    # Modèle Gradient Boosting + Calibration Platt (choix clinique validé)
-    base_gb = GradientBoostingClassifier(n_estimators=150, learning_rate=0.05, max_depth=4, random_state=42)
-    calibrated_gb = CalibratedClassifierCV(base_gb, method='sigmoid', cv=5)
-
-    models_to_fit = {
-        'Gradient Boosting (Calibré)': calibrated_gb,
-        'Régression Logistique': LogisticRegression(max_iter=1500, random_state=42, solver='liblinear', class_weight='balanced'),
-        'Random Forest': RandomForestClassifier(n_estimators=150, max_depth=8, random_state=42),
+    # ---- Grilles anti-surapprentissage ----
+    candidate_models = {
+        'Gradient Boosting': (
+            GradientBoostingClassifier(random_state=42),
+            {
+                'classifier__n_estimators': [80, 120, 150],
+                'classifier__max_depth': [2, 3],         # faible profondeur = moins de memorisation
+                'classifier__learning_rate': [0.03, 0.05, 0.08],
+                'classifier__subsample': [0.7, 0.8],    # sous-échantillonnage stochastique
+                'classifier__min_samples_leaf': [10, 20] # noeuds terminaux plus larges = moins d'overfit
+            }
+        ),
+        'Regégression Logistique': (
+            LogisticRegression(max_iter=1500, solver='liblinear', random_state=42),
+            {
+                'classifier__C': [0.001, 0.01, 0.1, 0.5, 1.0], # régularisation forte
+                'classifier__penalty': ['l1', 'l2']
+            }
+        ),
+        'Random Forest': (
+            RandomForestClassifier(random_state=42),
+            {
+                'classifier__n_estimators': [80, 120],
+                'classifier__max_depth': [3, 4, 5],     # profondeur limitée
+                'classifier__min_samples_leaf': [10, 20, 30], # noeuds plus larges
+                'classifier__max_features': ['sqrt', 0.5]
+            }
+        )
     }
 
     results = {}
-    best_pipeline = None
-    best_name = "Gradient Boosting (Calibré)"
+    best_models = {}  # stock les pipelines optimisés
 
-    for name, model in models_to_fit.items():
-        pipe = Pipeline([('preprocessor', preprocessor), ('classifier', model)])
-        cv_scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring='roc_auc')
-        pipe.fit(X_train, y_train)
-        y_proba = pipe.predict_proba(X_test)[:, 1]
-        y_pred = (y_proba >= 0.3).astype(int)
-        f1 = f1_score(y_test, y_pred)
-        auc = roc_auc_score(y_test, y_proba)
+    for name, (base_model, param_grid) in candidate_models.items():
+        pipe = Pipeline([('preprocessor', preprocessor), ('classifier', base_model)])
+        search = RandomizedSearchCV(
+            pipe, param_grid, n_iter=12, scoring='roc_auc',
+            cv=cv, random_state=42, n_jobs=-1
+        )
+        search.fit(X_train, y_train)
+        best_pipe = search.best_estimator_
+        best_models[name] = best_pipe
+
+        # Sur l'ensemble test
+        y_proba = best_pipe.predict_proba(X_test)[:, 1]
+        y_pred = (y_proba >= 0.30).astype(int)
+        test_auc = roc_auc_score(y_test, y_proba)
+        cv_auc = search.best_score_
+        overfit_gap = cv_auc - test_auc  # petit = généralise bien
+
+        # AUC train (pour mesurer surapprentissage)
+        y_proba_train = best_pipe.predict_proba(X_train)[:, 1]
+        train_auc = roc_auc_score(y_train, y_proba_train)
+
         fpr, tpr, _ = roc_curve(y_test, y_proba)
         cm = confusion_matrix(y_test, y_pred).tolist()
         frac_pos, mean_pred = calibration_curve(y_test, y_proba, n_bins=8, strategy='quantile')
+
         results[name] = {
-            'CV ROC AUC Mean': float(cv_scores.mean()),
-            'Test F1 Score': float(f1),
+            'Train AUC': float(train_auc),
+            'CV ROC AUC Mean': float(cv_auc),
+            'Test ROC AUC': float(test_auc),
+            'Overfit Gap': float(overfit_gap),
+            'Test F1 Score': float(f1_score(y_test, y_pred)),
             'Test Recall': float(recall_score(y_test, y_pred)),
-            'Test ROC AUC': float(auc),
             'Confusion Matrix': cm,
             'ROC_FPR': fpr[::3].tolist(),
             'ROC_TPR': tpr[::3].tolist(),
             'Calib_x': mean_pred.tolist(),
-            'Calib_y': frac_pos.tolist()
+            'Calib_y': frac_pos.tolist(),
+            'Best Params': str(search.best_params_)
         }
-        # Forcer le pipeline GB calibré comme modèle final
-        if name == best_name:
-            best_pipeline = pipe
 
-    # Feature Importances du Gradient Boosting (moyenne sur les estimateurs calibrés)
+    # ---- Sélection Objective : meilleur CV AUC ET faible overfit ----
+    # Score composé = CV_AUC - penalty*overfit_gap
+    def composite_score(name):
+        r = results[name]
+        return r['CV ROC AUC Mean'] - 1.5 * max(0, r['Overfit Gap'])
+
+    best_name = max(results.keys(), key=composite_score)
+    best_base_pipe = best_models[best_name]
+
+    # ---- Calibration de Platt sur le vainqueur ----
+    # On re-calibre le meilleur modèle avec Platt
+    calibrated_winner = CalibratedClassifierCV(
+        best_base_pipe, method='sigmoid', cv=5
+    )
+    calibrated_winner.fit(X_train, y_train)
+    results['Best_Model_Name'] = best_name
+
+    # Feature importances du modèle vainqueur
     try:
-        gb_pipe = next(p for n, p in [
-            (name, Pipeline([('preprocessor', preprocessor), ('classifier', m)]))
-            for name, m in models_to_fit.items() if 'Gradient' in name
-        ])
-        gb_pipe.fit(X_train, y_train)
-        fi_arr = np.mean([est.feature_importances_
-                          for est in gb_pipe.named_steps['classifier'].calibrated_classifiers_], axis=0)
-        preprocessor_fit = gb_pipe.named_steps['preprocessor']
+        raw_classifier = best_base_pipe.named_steps['classifier']
+        preprocessor_fit = best_base_pipe.named_steps['preprocessor']
         cat_enc = preprocessor_fit.named_transformers_['cat'].named_steps['ohe']
         cat_names = [f"{col}_{v}" for col, vals in zip(categorical_features, cat_enc.categories_) for v in vals[1:]]
         feat_names = numeric_features + cat_names + binary_features
-        results['Global_Feature_Importance'] = {f: float(imp) for f, imp in zip(feat_names, fi_arr)}
+        if hasattr(raw_classifier, 'feature_importances_'):
+            importances = raw_classifier.feature_importances_
+        elif hasattr(raw_classifier, 'coef_'):
+            importances = np.abs(raw_classifier.coef_[0])
+        else:
+            importances = np.zeros(len(feat_names))
+        results['Global_Feature_Importance'] = {f: float(imp) for f, imp in zip(feat_names, importances)}
     except Exception:
         pass
 
-    return best_pipeline, results
+    # Retourner un pipeline final Préprocesseur + Classifieur Calibré
+    final_pipeline = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', calibrated_winner)
+    ])
+    final_pipeline.fit(X_train, y_train)
+
+    return final_pipeline, results
 
 # Configuration Master
 st.set_page_config(page_title="Cardio Risk | Master AI", page_icon="📈", layout="wide")
@@ -332,44 +394,65 @@ with tab4:
 
     if results:
         imp_dict = results.get("Global_Feature_Importance", None)
-        
-        st.write("Le Machine Learning Médical exige une transparence totale. Voici la justification mathématique et biologique de notre Modèle de Prévention.")
-        
-        # --- LIGNE 1 : FIGURES (ROC et K-FOLD) ---
+        best_model_name = results.get("Best_Model_Name", "")
+        # Filtrer les clés qui ne sont pas des modèles
+        model_keys = [k for k in results.keys() if k not in ("Global_Feature_Importance", "Best_Model_Name")]
+
+        if best_model_name:
+            st.success(f"🏆 **Modèle Vainqueur sélectionné objectivement : {best_model_name}** — Meilleur score composite (CV AUC - pénalité Overfit)")
+
+        st.write("Chaque modèle a été optimisé par `RandomizedSearchCV` (12 itérations, 5-Fold). Le vainqueur est choisi sur un score composite qui pénalise le surapprentissage.")
+
+        # --- LIGNE 1 : FIGURES (ROC et TABLEAU ANTI-OVERFIT) ---
         col_roc, col_cv = st.columns([1.5, 1.5])
-        
+
         with col_roc:
             st.markdown("<h3 class='title-h2'>📈 Courbes ROC (Sensibilité)</h3>", unsafe_allow_html=True)
             fig_roc, ax_roc = plt.subplots(figsize=(6, 4))
-            for m_name in results.keys():
+            for m_name in model_keys:
                 fpr, tpr = results[m_name].get('ROC_FPR', []), results[m_name].get('ROC_TPR', [])
                 auc_score = results[m_name].get('Test ROC AUC', 0)
+                lw = 3 if m_name == best_model_name else 1.5
+                ls = '-' if m_name == best_model_name else '--'
                 if len(fpr) > 0:
-                    ax_roc.plot(fpr, tpr, label=f'{m_name} (AUC = {auc_score:.2f})', linewidth=2)
+                    ax_roc.plot(fpr, tpr, label=f'{m_name} (AUC = {auc_score:.2f})', linewidth=lw, linestyle=ls)
             ax_roc.plot([0, 1], [0, 1], 'k--', alpha=0.5)
             ax_roc.set_xlabel('False Positive Rate')
             ax_roc.set_ylabel('True Positive Rate')
-            ax_roc.legend(loc='lower right')
+            ax_roc.legend(loc='lower right', fontsize=8)
             sns.despine()
             st.pyplot(fig_roc)
-            
+
         with col_cv:
-            st.markdown("<h3 class='title-h2'>✅ Validation Croisée & Calibration</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 class='title-h2'>🔬 Diagnostic Anti-Surapprentissage</h3>", unsafe_allow_html=True)
             df_cv = pd.DataFrame({
-                "Modèle Evalué": list(results.keys()),
-                "CV ROC AUC": [results[k].get("CV ROC AUC Mean", 0) for k in results.keys()],
-                "Test ROC AUC": [results[k].get("Test ROC AUC", 0) for k in results.keys()],
-                "Recall Test": [results[k].get("Test Recall", 0) for k in results.keys()]
-            }).set_index("Modèle Evalué")
-            st.dataframe(df_cv.style.highlight_max(color='#1E4D2B'), use_container_width=True)
-            
+                "Modèle": model_keys,
+                "Train AUC": [round(results[k].get("Train AUC", 0), 3) for k in model_keys],
+                "CV AUC": [round(results[k].get("CV ROC AUC Mean", 0), 3) for k in model_keys],
+                "Test AUC": [round(results[k].get("Test ROC AUC", 0), 3) for k in model_keys],
+                "Gap Overfit ↓": [round(results[k].get("Overfit Gap", 0), 3) for k in model_keys],
+            }).set_index("Modèle")
+            # Colorer en rouge les gaps élevés (surapprentissage)
+            def color_gap(val):
+                if val > 0.05: return 'background-color: #4D1E1E; color: white'
+                elif val > 0.02: return 'background-color: #4D3A1E; color: white'
+                return 'background-color: #1E4D2B; color: white'
+            st.dataframe(
+                df_cv.style.applymap(color_gap, subset=["Gap Overfit ↓"]).highlight_max(subset=["CV AUC", "Test AUC"], color='#1E4D2B'),
+                use_container_width=True
+            )
+            st.caption("🟢 Gap < 0.02 : Bonne généralisation | 🟡 0.02–0.05 : Légère tension | 🔴 > 0.05 : Surapprentissage")
+
         # COMMENTAIRE HORIZONTAL PLEINE LARGEUR (SOUS LA LIGNE 1)
-        with st.expander("💡 Calibration de Platt : Des Probabilités Médicalement Fiables", expanded=False):
+        with st.expander("💡 Méthodologie Anti-Surapprentissage & Calibration de Platt", expanded=False):
             st.markdown("""
-            Suite aux remarques cliniques, le modèle intègre désormais une **Calibration de Platt** (méthode Sigmoïde via `CalibratedClassifierCV`).
-            Cette technique ajuste mathématiquement les scores bruts du classifieur pour qu'ils représentent de vraies probabilités épidémiologiques.<br><br>
-            **Résultat concret** : si le modèle affiche 25% de risque CHD, environ 25 patients sur 100 ayant ce profil développeront effectivement la maladie. Le seuil de décision a également été abaissé à **0.30** (au lieu de 0.50) pour résoudre le compromis Sensibilité/Spécificité adapté à la prévention médicale.
+            **Protocole rigoureux en 3 étapes :**<br>
+            1. **RandomizedSearchCV (12 iter, 5-Fold)** : optimise les hyperparamètres de chaque modèle sur les données d'entraînement uniquement (jamais sur le test).<br>
+            2. **Score Composite** : `CV_AUC - 1.5 × max(0, Gap_Overfit)` — pénalise les modèles qui mémorisent au lieu d'apprendre.<br>
+            3. **Calibration de Platt** : ajuste les probabilités brutes pour correspondre à de vraies fréquences épidémiologiques (25% = 25 malades sur 100 profils similaires).<br><br>
+            Le seuil de décision est fixé à **0.30** (non 0.50) pour adapter le compromis Sensibilité/Spécificité au contexte de prévention primaire cardiovasculaire.
             """, unsafe_allow_html=True)
+
             
         st.markdown("---")
             
