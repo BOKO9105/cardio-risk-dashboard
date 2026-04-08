@@ -54,33 +54,30 @@ def train_model_and_results():
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    # IMPORTANT : pas de class_weight ici, on calibre correctement les probabilités avec Platt
-    base_lr = LogisticRegression(max_iter=1500, random_state=42, solver='liblinear')
-    calibrated_lr = CalibratedClassifierCV(base_lr, method='sigmoid', cv=5)
+    # Modèle Gradient Boosting + Calibration Platt (choix clinique validé)
+    base_gb = GradientBoostingClassifier(n_estimators=150, learning_rate=0.05, max_depth=4, random_state=42)
+    calibrated_gb = CalibratedClassifierCV(base_gb, method='sigmoid', cv=5)
 
     models_to_fit = {
-        'Régression Logistique (Calibrée)': calibrated_lr,
+        'Gradient Boosting (Calibré)': calibrated_gb,
+        'Régression Logistique': LogisticRegression(max_iter=1500, random_state=42, solver='liblinear', class_weight='balanced'),
         'Random Forest': RandomForestClassifier(n_estimators=150, max_depth=8, random_state=42),
-        'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
     }
 
     results = {}
     best_pipeline = None
-    best_auc = 0
-    best_name = ""
+    best_name = "Gradient Boosting (Calibré)"
 
     for name, model in models_to_fit.items():
         pipe = Pipeline([('preprocessor', preprocessor), ('classifier', model)])
         cv_scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring='roc_auc')
         pipe.fit(X_train, y_train)
         y_proba = pipe.predict_proba(X_test)[:, 1]
-        # Seuil ajusté à 0.3 pour la classification (compromis Sensibilité/Spécificité médical)
         y_pred = (y_proba >= 0.3).astype(int)
         f1 = f1_score(y_test, y_pred)
         auc = roc_auc_score(y_test, y_proba)
         fpr, tpr, _ = roc_curve(y_test, y_proba)
         cm = confusion_matrix(y_test, y_pred).tolist()
-        # Courbe de calibration (fiabilité des probabilités)
         frac_pos, mean_pred = calibration_curve(y_test, y_proba, n_bins=8, strategy='quantile')
         results[name] = {
             'CV ROC AUC Mean': float(cv_scores.mean()),
@@ -93,27 +90,24 @@ def train_model_and_results():
             'Calib_x': mean_pred.tolist(),
             'Calib_y': frac_pos.tolist()
         }
-        if auc > best_auc:
-            best_auc = auc
+        # Forcer le pipeline GB calibré comme modèle final
+        if name == best_name:
             best_pipeline = pipe
-            best_name = name
 
-    # Coefficients du meilleur modèle (Logistique calibrée)
+    # Feature Importances du Gradient Boosting (moyenne sur les estimateurs calibrés)
     try:
-        lr_pipe = None
-        for n, m in models_to_fit.items():
-            if 'Logistique' in n:
-                lr_pipe = Pipeline([('preprocessor', preprocessor), ('classifier', m)])
-                lr_pipe.fit(X_train, y_train)
-                break
-        if lr_pipe:
-            # Les coefficients sont dans les estimateurs calibrés
-            coef_arr = np.mean([est.coef_[0] for est in lr_pipe.named_steps['classifier'].calibrated_classifiers_], axis=0)
-            preprocessor_fit = lr_pipe.named_steps['preprocessor']
-            cat_enc = preprocessor_fit.named_transformers_['cat'].named_steps['ohe']
-            cat_names = [f"{col}_{v}" for col, vals in zip(categorical_features, cat_enc.categories_) for v in vals[1:]]
-            feat_names = numeric_features + cat_names + binary_features
-            results['Global_Feature_Importance'] = {f: float(abs(c)) for f, c in zip(feat_names, coef_arr)}
+        gb_pipe = next(p for n, p in [
+            (name, Pipeline([('preprocessor', preprocessor), ('classifier', m)]))
+            for name, m in models_to_fit.items() if 'Gradient' in name
+        ])
+        gb_pipe.fit(X_train, y_train)
+        fi_arr = np.mean([est.feature_importances_
+                          for est in gb_pipe.named_steps['classifier'].calibrated_classifiers_], axis=0)
+        preprocessor_fit = gb_pipe.named_steps['preprocessor']
+        cat_enc = preprocessor_fit.named_transformers_['cat'].named_steps['ohe']
+        cat_names = [f"{col}_{v}" for col, vals in zip(categorical_features, cat_enc.categories_) for v in vals[1:]]
+        feat_names = numeric_features + cat_names + binary_features
+        results['Global_Feature_Importance'] = {f: float(imp) for f, imp in zip(feat_names, fi_arr)}
     except Exception:
         pass
 
