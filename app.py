@@ -429,7 +429,7 @@ with tab4:
                 elif val > 0.02: return 'background-color: #4D3A1E; color: white'
                 return 'background-color: #1E4D2B; color: white'
             st.dataframe(
-                df_cv.style.applymap(color_gap, subset=["Gap Overfit ↓"]).highlight_max(subset=["CV AUC", "Test AUC"], color='#1E4D2B'),
+                df_cv.style.map(color_gap, subset=["Gap Overfit ↓"]).highlight_max(subset=["CV AUC", "Test AUC"], color='#1E4D2B'),
                 use_container_width=True
             )
             st.caption("🟢 Gap < 0.02 : Bonne généralisation | 🟡 0.02–0.05 : Légère tension | 🔴 > 0.05 : Surapprentissage")
