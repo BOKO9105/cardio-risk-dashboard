@@ -141,14 +141,8 @@ def train_model_and_results():
     best_base_pipe = best_models[best_name]
     results['Best_Model_Name'] = best_name
 
-    # ---- Calibration de Platt avec cv='prefit' (évite le bug DataFrame/numpy) ----
-    # On divise X_train en train2 (fit) + val (calibration)
-    X_train2, X_val, y_train2, y_val = train_test_split(
-        X_train, y_train, test_size=0.2, stratify=y_train, random_state=0
-    )
-    best_base_pipe.fit(X_train2, y_train2)  # fit sur train2 (DataFrame → OK)
-    calibrated_winner = CalibratedClassifierCV(best_base_pipe, method='sigmoid', cv='prefit')
-    calibrated_winner.fit(X_val, y_val)     # calibre sur val (DataFrame → OK)
+    # Réentraîner sur tout X_train pour le modèle de production final
+    best_base_pipe.fit(X_train, y_train)
 
     # Feature importances du modèle vainqueur
     try:
@@ -167,13 +161,10 @@ def train_model_and_results():
     except Exception:
         pass
 
-    # Pipeline final : préprocesseur + classifieur calibré (cv='prefit' = pas de refit interne)
-    final_pipeline = Pipeline([
-        ('preprocessor', best_base_pipe.named_steps['preprocessor']),
-        ('classifier', calibrated_winner)
-    ])
+    # Modèle final = pipeline optimisé (RandomizedSearchCV + forte régularisation)
+    # La calibration visuelle (courbe) est disponible dans l'onglet Modélisation
+    return best_base_pipe, results
 
-    return final_pipeline, results
 
 # Configuration Master
 st.set_page_config(page_title="Cardio Risk | Master AI", page_icon="📈", layout="wide")
