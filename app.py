@@ -133,21 +133,22 @@ def train_model_and_results():
         }
 
     # ---- Sélection Objective : meilleur CV AUC ET faible overfit ----
-    # Score composé = CV_AUC - penalty*overfit_gap
     def composite_score(name):
         r = results[name]
         return r['CV ROC AUC Mean'] - 1.5 * max(0, r['Overfit Gap'])
 
     best_name = max(results.keys(), key=composite_score)
     best_base_pipe = best_models[best_name]
-
-    # ---- Calibration de Platt sur le vainqueur ----
-    # On re-calibre le meilleur modèle avec Platt
-    calibrated_winner = CalibratedClassifierCV(
-        best_base_pipe, method='sigmoid', cv=5
-    )
-    calibrated_winner.fit(X_train, y_train)
     results['Best_Model_Name'] = best_name
+
+    # ---- Calibration de Platt avec cv='prefit' (évite le bug DataFrame/numpy) ----
+    # On divise X_train en train2 (fit) + val (calibration)
+    X_train2, X_val, y_train2, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, stratify=y_train, random_state=0
+    )
+    best_base_pipe.fit(X_train2, y_train2)  # fit sur train2 (DataFrame → OK)
+    calibrated_winner = CalibratedClassifierCV(best_base_pipe, method='sigmoid', cv='prefit')
+    calibrated_winner.fit(X_val, y_val)     # calibre sur val (DataFrame → OK)
 
     # Feature importances du modèle vainqueur
     try:
@@ -166,12 +167,11 @@ def train_model_and_results():
     except Exception:
         pass
 
-    # Retourner un pipeline final Préprocesseur + Classifieur Calibré
+    # Pipeline final : préprocesseur + classifieur calibré (cv='prefit' = pas de refit interne)
     final_pipeline = Pipeline([
-        ('preprocessor', preprocessor),
+        ('preprocessor', best_base_pipe.named_steps['preprocessor']),
         ('classifier', calibrated_winner)
     ])
-    final_pipeline.fit(X_train, y_train)
 
     return final_pipeline, results
 
