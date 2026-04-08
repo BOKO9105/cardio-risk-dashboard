@@ -20,14 +20,15 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics import f1_score, recall_score, roc_auc_score, confusion_matrix, roc_curve
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from scipy.cluster.hierarchy import dendrogram, linkage
 
 warnings.filterwarnings('ignore')
 
-# ---- Entraînement dynamique (compatible toutes versions Python) ----
+# ---- Entraînement dynamique + Calibration de Platt ----
 @st.cache_resource
 def train_model_and_results():
-    """Entraîne le modèle au démarrage de l'app et retourne le pipeline et les résultats."""
+    """Entraîne le modèle au démarrage de l'app et retourne le pipeline calibré et les résultats."""
     try:
         df = pd.read_csv("data/train.csv")
     except:
@@ -53,46 +54,68 @@ def train_model_and_results():
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
+    # IMPORTANT : pas de class_weight ici, on calibre correctement les probabilités avec Platt
+    base_lr = LogisticRegression(max_iter=1500, random_state=42, solver='liblinear')
+    calibrated_lr = CalibratedClassifierCV(base_lr, method='sigmoid', cv=5)
+
     models_to_fit = {
-        'Régression Logistique': LogisticRegression(max_iter=1500, random_state=42, class_weight='balanced', solver='liblinear'),
-        'Random Forest': RandomForestClassifier(n_estimators=150, max_depth=10, random_state=42, class_weight='balanced'),
+        'Régression Logistique (Calibrée)': calibrated_lr,
+        'Random Forest': RandomForestClassifier(n_estimators=150, max_depth=8, random_state=42),
         'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
     }
 
     results = {}
     best_pipeline = None
-    best_f1 = 0
+    best_auc = 0
     best_name = ""
 
     for name, model in models_to_fit.items():
         pipe = Pipeline([('preprocessor', preprocessor), ('classifier', model)])
-        cv_scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring='f1')
+        cv_scores = cross_val_score(pipe, X_train, y_train, cv=cv, scoring='roc_auc')
         pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_test)
         y_proba = pipe.predict_proba(X_test)[:, 1]
+        # Seuil ajusté à 0.3 pour la classification (compromis Sensibilité/Spécificité médical)
+        y_pred = (y_proba >= 0.3).astype(int)
         f1 = f1_score(y_test, y_pred)
+        auc = roc_auc_score(y_test, y_proba)
         fpr, tpr, _ = roc_curve(y_test, y_proba)
         cm = confusion_matrix(y_test, y_pred).tolist()
+        # Courbe de calibration (fiabilité des probabilités)
+        frac_pos, mean_pred = calibration_curve(y_test, y_proba, n_bins=8, strategy='quantile')
         results[name] = {
-            'CV F1 Score Mean': float(cv_scores.mean()),
+            'CV ROC AUC Mean': float(cv_scores.mean()),
             'Test F1 Score': float(f1),
             'Test Recall': float(recall_score(y_test, y_pred)),
-            'Test ROC AUC': float(roc_auc_score(y_test, y_proba)),
+            'Test ROC AUC': float(auc),
             'Confusion Matrix': cm,
             'ROC_FPR': fpr[::3].tolist(),
-            'ROC_TPR': tpr[::3].tolist()
+            'ROC_TPR': tpr[::3].tolist(),
+            'Calib_x': mean_pred.tolist(),
+            'Calib_y': frac_pos.tolist()
         }
-        if name == 'Régression Logistique':
-            preprocessor_fit = pipe.named_steps['preprocessor'].fit(X_train)
+        if auc > best_auc:
+            best_auc = auc
+            best_pipeline = pipe
+            best_name = name
+
+    # Coefficients du meilleur modèle (Logistique calibrée)
+    try:
+        lr_pipe = None
+        for n, m in models_to_fit.items():
+            if 'Logistique' in n:
+                lr_pipe = Pipeline([('preprocessor', preprocessor), ('classifier', m)])
+                lr_pipe.fit(X_train, y_train)
+                break
+        if lr_pipe:
+            # Les coefficients sont dans les estimateurs calibrés
+            coef_arr = np.mean([est.coef_[0] for est in lr_pipe.named_steps['classifier'].calibrated_classifiers_], axis=0)
+            preprocessor_fit = lr_pipe.named_steps['preprocessor']
             cat_enc = preprocessor_fit.named_transformers_['cat'].named_steps['ohe']
             cat_names = [f"{col}_{v}" for col, vals in zip(categorical_features, cat_enc.categories_) for v in vals[1:]]
             feat_names = numeric_features + cat_names + binary_features
-            coefs = pipe.named_steps['classifier'].coef_[0]
-            results['Global_Feature_Importance'] = {f: float(abs(c)) for f, c in zip(feat_names, coefs)}
-        if f1 > best_f1:
-            best_f1 = f1
-            best_pipeline = pipe
-            best_name = name
+            results['Global_Feature_Importance'] = {f: float(abs(c)) for f, c in zip(feat_names, coef_arr)}
+    except Exception:
+        pass
 
     return best_pipeline, results
 
@@ -337,46 +360,68 @@ with tab4:
             st.pyplot(fig_roc)
             
         with col_cv:
-            st.markdown("<h3 class='title-h2'>✅ Stratified K-Fold (Moyenne = 5)</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 class='title-h2'>✅ Validation Croisée & Calibration</h3>", unsafe_allow_html=True)
             df_cv = pd.DataFrame({
                 "Modèle Evalué": list(results.keys()),
-                "F1 Score Modéré": [results[k].get("CV F1 Score Mean", 0) for k in results.keys()],
+                "CV ROC AUC": [results[k].get("CV ROC AUC Mean", 0) for k in results.keys()],
+                "Test ROC AUC": [results[k].get("Test ROC AUC", 0) for k in results.keys()],
                 "Recall Test": [results[k].get("Test Recall", 0) for k in results.keys()]
             }).set_index("Modèle Evalué")
             st.dataframe(df_cv.style.highlight_max(color='#1E4D2B'), use_container_width=True)
             
         # COMMENTAIRE HORIZONTAL PLEINE LARGEUR (SOUS LA LIGNE 1)
-        with st.expander("💡 Pourquoi la modeste Régression Logistique a-t-elle remporté le combat ?", expanded=False):
+        with st.expander("💡 Calibration de Platt : Des Probabilités Médicalement Fiables", expanded=False):
             st.markdown("""
-            Contre toute attente liée à la mode des modèles profonds complexes (Gradient Boosting, Random Forest), la **Régression Logistique Statistique** s'est avérée être le choix scientifique parfait pour notre outil.<br><br>
-            **Explication Technique :** Sur des données médicales biaisées où les malades ne pèsent que 15%, les arbres décisionnels (Random Forest) paniquent et préfèrent ignorer la classe minoritaire, générant d'énormes biais (il classe tout le monde comme Sain pour ne pas se tromper). La Régression Logistique pénalisée préserve cette limite et compense mathématiquement pour générer le meilleur **Recall** (trouver la vaste majorité des malades).
+            Suite aux remarques cliniques, le modèle intègre désormais une **Calibration de Platt** (méthode Sigmoïde via `CalibratedClassifierCV`).
+            Cette technique ajuste mathématiquement les scores bruts du classifieur pour qu'ils représentent de vraies probabilités épidémiologiques.<br><br>
+            **Résultat concret** : si le modèle affiche 25% de risque CHD, environ 25 patients sur 100 ayant ce profil développeront effectivement la maladie. Le seuil de décision a également été abaissé à **0.30** (au lieu de 0.50) pour résoudre le compromis Sensibilité/Spécificité adapté à la prévention médicale.
             """, unsafe_allow_html=True)
             
         st.markdown("---")
             
-        # --- LIGNE 2 : FIGURES (MATRICES et FEATURE IMPORTANCE) ---
-        col_cm, col_imp = st.columns([1.5, 1.5])
+        # --- LIGNE 2 : FIGURES (CALIBRATION + MATRICES + IMPORTANCE) ---
+        col_calib, col_cm, col_imp = st.columns([1, 1.2, 1])
+        
+        with col_calib:
+            st.markdown("<h3 class='title-h2'>📊 Courbe de Calibration</h3>", unsafe_allow_html=True)
+            lr_key = next((k for k in results if 'Logistique' in k), None)
+            if lr_key:
+                calib_x = results[lr_key].get('Calib_x', [])
+                calib_y = results[lr_key].get('Calib_y', [])
+                if calib_x:
+                    fig_cal, ax_cal = plt.subplots(figsize=(5, 4))
+                    ax_cal.plot(calib_x, calib_y, 's-', color='#E63946', label='Logistique Calibrée')
+                    ax_cal.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Calibration Parfaite')
+                    ax_cal.set_xlabel('Score Prédit (Probabilité Modèle)')
+                    ax_cal.set_ylabel('Fraction Réelle de Malades')
+                    ax_cal.legend(loc='upper left')
+                    sns.despine()
+                    st.pyplot(fig_cal)
+                    st.caption("Plus la courbe rouge est proche de la diagonale noire, plus les probabilités sont fiables.")
         
         with col_cm:
-            st.markdown("<h3 class='title-h2'>🎯 Matrices de Confusions (Le Cheat Code)</h3>", unsafe_allow_html=True)
-            mat_lr = np.array(results.get('Régression Logistique', {}).get('Confusion Matrix', [[0,0],[0,0]]))
+            st.markdown("<h3 class='title-h2'>🎯 Matrices de Confusion</h3>", unsafe_allow_html=True)
+            lr_key = next((k for k in results if 'Logistique' in k), None)
+            mat_lr = np.array(results.get(lr_key, {}).get('Confusion Matrix', [[0,0],[0,0]])) if lr_key else np.zeros((2,2))
             mat_rf = np.array(results.get('Random Forest', {}).get('Confusion Matrix', [[0,0],[0,0]]))
-            fig_cm, axes_cm = plt.subplots(1, 2, figsize=(9, 3.5))
+            fig_cm, axes_cm = plt.subplots(1, 2, figsize=(8, 3.5))
             sns.heatmap(mat_lr, annot=True, fmt='d', cmap='Blues', ax=axes_cm[0], cbar=False)
-            axes_cm[0].set_title('Logistique Vainqueur')
+            axes_cm[0].set_title('Logistique (Calibrée)')
             axes_cm[0].set_ylabel('Vérité Médicale')
             sns.heatmap(mat_rf, annot=True, fmt='d', cmap='Reds', ax=axes_cm[1], cbar=False)
-            axes_cm[1].set_title('Random Forest (Perdant)')
+            axes_cm[1].set_title('Random Forest')
             st.pyplot(fig_cm)
 
         with col_imp:
-            st.markdown("<h3 class='title-h2'>🔑 Poids Médicaux Isolés (Coefficients)</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 class='title-h2'>🔑 Poids Médicaux (Coefficients)</h3>", unsafe_allow_html=True)
             if imp_dict:
                 imp_s = pd.Series(imp_dict).sort_values(ascending=True).tail(6)
-                fig_imp, ax_imp = plt.subplots(figsize=(6, 3.8))
+                fig_imp, ax_imp = plt.subplots(figsize=(5, 3.8))
                 imp_s.plot(kind='barh', color='#E63946', ax=ax_imp)
                 sns.despine()
                 st.pyplot(fig_imp)
+            else:
+                st.info("Coefficients logistiques non disponibles pour cet exécution.")
                 
         # COMMENTAIRE HORIZONTAL PLEINE LARGEUR (SOUS LA LIGNE 2)
         with st.expander("💡 Ouverture de la Boite Noire : Les Poids Majeurement Inculpés", expanded=False):
